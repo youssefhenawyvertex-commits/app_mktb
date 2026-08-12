@@ -944,6 +944,183 @@ function geojsonGeometryContainsLatLng(geometry, latlng) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+   CAD IMPORT — DXF closed POLYLINE/LWPOLYLINE -> real GeoJSON Polygon
+   ────────────────────────────────────────────────────────────────────────── */
+function cadDxfPairs(text) {
+  const raw = String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const out = [];
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    const code = Number(String(raw[i]).trim());
+    if (!Number.isFinite(code)) continue;
+    out.push({ code, value: String(raw[i + 1] ?? '').trim() });
+  }
+  return out;
+}
+
+function cadEntityBlocks(text) {
+  const pairs = cadDxfPairs(text);
+  const entities = [];
+  let inEntities = false;
+  let current = null;
+  for (const p of pairs) {
+    if (p.code === 0 && p.value === 'SECTION') { current = { type: '__SECTION__' }; continue; }
+    if (p.code === 2 && current?.type === '__SECTION__') {
+      inEntities = p.value.toUpperCase() === 'ENTITIES';
+      current = null;
+      continue;
+    }
+    if (!inEntities) continue;
+    if (p.code === 0) {
+      if (current && current.type !== '__SECTION__') entities.push(current);
+      current = { type: p.value.toUpperCase(), pairs: [] };
+      continue;
+    }
+    if (current) current.pairs.push(p);
+  }
+  if (current && current.type !== '__SECTION__') entities.push(current);
+  return entities;
+}
+
+function cadPairValue(pairs, code, fallback = null) {
+  const p = (pairs || []).find(x => x.code === code);
+  return p ? p.value : fallback;
+}
+
+function cadClosed(v) {
+  return (Number(v) & 1) === 1;
+}
+
+function cadNearlySame(a, b, tol = 1e-7) {
+  return !!a && !!b && Math.hypot(Number(a[0]) - Number(b[0]), Number(a[1]) - Number(b[1])) <= tol;
+}
+
+/* Expand a DXF bulge segment into straight vertices so curved CAD boundaries
+   still become a usable Polygon rather than silently losing the arc. */
+function cadBulgeSegment(a, b, bulge, maxSteps = 24) {
+  const bb = Number(bulge) || 0;
+  if (!bb || cadNearlySame(a, b)) return [a];
+  const x1 = Number(a[0]), y1 = Number(a[1]);
+  const x2 = Number(b[0]), y2 = Number(b[1]);
+  const dx = x2 - x1, dy = y2 - y1;
+  const chord = Math.hypot(dx, dy);
+  if (!Number.isFinite(chord) || chord === 0) return [a];
+
+  const theta = 4 * Math.atan(bb);
+  const half = theta / 2;
+  const sinHalf = Math.sin(Math.abs(half));
+  if (Math.abs(sinHalf) < 1e-12) return [a];
+
+  const radius = chord / (2 * sinHalf);
+  const mx = (x1 + x2) / 2;
+  const my = (y1 + y2) / 2;
+  const nx = -dy / chord;
+  const ny = dx / chord;
+  const offset = chord * (1 - bb * bb) / (4 * bb);
+  const cx = mx + nx * offset;
+  const cy = my + ny * offset;
+  const a0 = Math.atan2(y1 - cy, x1 - cx);
+
+  let sweep = theta;
+  while (sweep > Math.PI * 2) sweep -= Math.PI * 2;
+  while (sweep < -Math.PI * 2) sweep += Math.PI * 2;
+  const steps = Math.max(2, Math.min(maxSteps, Math.ceil(Math.abs(sweep) / (Math.PI / 18))));
+  const out = [a];
+  for (let i = 1; i < steps; i++) {
+    const ang = a0 + sweep * (i / steps);
+    out.push([cx + radius * Math.cos(ang), cy + radius * Math.sin(ang)]);
+  }
+  return out;
+}
+
+function cadExpandVertices(vertices, closed) {
+  const src = (vertices || []).filter(v => Number.isFinite(Number(v.x)) && Number.isFinite(Number(v.y)));
+  if (src.length < 2) return [];
+  const out = [];
+  const end = closed ? src.length : src.length - 1;
+  for (let i = 0; i < end; i++) {
+    const a = src[i];
+    const b = src[(i + 1) % src.length];
+    const seg = cadBulgeSegment([a.x, a.y], [b.x, b.y], a.bulge);
+    out.push(...seg);
+  }
+  if (closed && out.length) {
+    const first = out[0];
+    const last = out[out.length - 1];
+    if (!cadNearlySame(first, last)) out.push(first.slice());
+    else out[out.length - 1] = first.slice();
+  }
+  return out;
+}
+
+function parseCadDxfClosedPolylines(text) {
+  const entities = cadEntityBlocks(text);
+  const result = [];
+  for (let i = 0; i < entities.length; i++) {
+    const e = entities[i];
+    const layer = cadPairValue(e.pairs, 8, '0') || '0';
+
+    if (e.type === 'LWPOLYLINE') {
+      const flags = Number(cadPairValue(e.pairs, 70, 0));
+      const closed = cadClosed(flags);
+      if (!closed) continue;
+      const verts = [];
+      let cur = null;
+      for (const p of e.pairs) {
+        if (p.code === 10) {
+          if (cur) verts.push(cur);
+          cur = { x: Number(p.value), y: 0, bulge: 0 };
+        } else if (cur && p.code === 20) cur.y = Number(p.value);
+        else if (cur && p.code === 42) cur.bulge = Number(p.value) || 0;
+      }
+      if (cur) verts.push(cur);
+      const coords = cadExpandVertices(verts, true);
+      if (coords.length >= 4) result.push({ layer, coords });
+      continue;
+    }
+
+    if (e.type === 'POLYLINE') {
+      const flags = Number(cadPairValue(e.pairs, 70, 0));
+      if (!cadClosed(flags) || (flags & 8) || (flags & 16) || (flags & 32) || (flags & 64)) continue;
+      const verts = [];
+      for (let j = i + 1; j < entities.length; j++) {
+        const v = entities[j];
+        if (v.type === 'SEQEND') { i = j; break; }
+        if (v.type !== 'VERTEX') continue;
+        const x = Number(cadPairValue(v.pairs, 10));
+        const y = Number(cadPairValue(v.pairs, 20));
+        const bulge = Number(cadPairValue(v.pairs, 42, 0)) || 0;
+        if (Number.isFinite(x) && Number.isFinite(y)) verts.push({ x, y, bulge });
+      }
+      const coords = cadExpandVertices(verts, true);
+      if (coords.length >= 4) result.push({ layer, coords });
+    }
+  }
+  return result;
+}
+
+function cadLooksProjected(features) {
+  const pts = (features || []).flatMap(f => f.coords || []).slice(0, 80);
+  if (!pts.length) return false;
+  return pts.some(p => Math.abs(Number(p[0])) > 180 || Math.abs(Number(p[1])) > 90);
+}
+
+function cadUtmPrj(zone, hemi) {
+  const cm = (zone - 1) * 6 - 180 + 3;
+  const fn = hemi === 'S' ? 10000000 : 0;
+  return `PROJCS["WGS_1984_UTM_Zone_${zone}${hemi}",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",` +
+    `SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],` +
+    `UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],` +
+    `PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",${fn}],` +
+    `PARAMETER["Central_Meridian",${cm}],PARAMETER["Scale_Factor",0.9996],` +
+    `PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]`;
+}
+
+function cadWgs84Prj() {
+  return 'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],' +
+    'PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]';
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
    UTM helpers
    ────────────────────────────────────────────────────────────────────────── */
 /** UTM zone number from longitude (1..60). */
@@ -2825,13 +3002,23 @@ const AttributeTableModal = ({ layer, onClose, onZoomFeature, onToggleFeatureVis
 
   const columns = useMemo(() => {
     const seen = new Map();
+    const hiddenAttributeColumns = new Set(["CAD_LAYER", "SOURCE"]);
+
     if (layer?.attributesEnabled && Array.isArray(layer.attributeFields)) {
-      layer.attributeFields.forEach(f => seen.set(f.key, true));
+      layer.attributeFields.forEach(f => {
+        if (!hiddenAttributeColumns.has(String(f.key))) seen.set(f.key, true);
+      });
     }
+
     features.forEach(f => {
       const p = f.properties || {};
-      Object.keys(p).forEach(k => { if (!seen.has(k)) seen.set(k, true); });
+      Object.keys(p).forEach(k => {
+        // CAD_LAYER و SOURCE بيانات داخلية لمصدر الـCAD؛ لا تظهر في Attribute Table.
+        // تظل محفوظة داخل properties حتى لا نكسر التصدير أو أي معالجة لاحقة.
+        if (!hiddenAttributeColumns.has(String(k)) && !seen.has(k)) seen.set(k, true);
+      });
     });
+
     return Array.from(seen.keys());
   }, [features, layer?.attributesEnabled, layer?.attributeFields]);
 
@@ -6288,37 +6475,134 @@ const isSheetFile = (file) => {
   return /\.(xlsx|xls|csv)$/i.test(file.name);
 };
 
+const isCadFile = (file) => {
+  return /\.(dxf|dwg)$/i.test(file.name);
+};
+
 const loadMixedFiles = async (files) => {
   const list = Array.from(files || []);
-
   if (list.length === 0) return;
 
   const archives = list.filter(isArchiveFile);
   const sheets = list.filter(isSheetFile);
-  const unsupported = list.filter(f => !isArchiveFile(f) && !isSheetFile(f));
+  const cad = list.filter(isCadFile);
+  const unsupported = list.filter(f => !isArchiveFile(f) && !isSheetFile(f) && !isCadFile(f));
 
   if (unsupported.length) {
     showToast(
-      `تم تجاهل ${unsupported.length} ملف غير مدعوم. استخدم ZIP/RAR أو Excel/CSV`,
-      "info",
-      4200
+      `تم تجاهل ${unsupported.length} ملف غير مدعوم. استخدم ZIP/RAR أو Excel/CSV أو DXF/DWG`,
+      "info", 4200
     );
   }
 
-  if (archives.length === 0 && sheets.length === 0) {
-    showToast("لم يتم العثور على Shapefile أو شيت قابل للتحميل", "err", 4200);
+  if (archives.length === 0 && sheets.length === 0 && cad.length === 0) {
+    showToast("لم يتم العثور على ملف قابل للتحميل", "err", 4200);
     return;
   }
 
-  // مهم: نحمّل الشيب فايل الأول، بعده الشيتات
-  for (const file of archives) {
-    await loadShapefile(file);
-  }
-
-  for (const file of sheets) {
-    await loadSheet(file);
-  }
+  for (const file of archives) await loadShapefile(file);
+  for (const file of sheets) await loadSheet(file);
+  for (const file of cad) await loadCadFile(file);
 };
+
+  /* ----- Upload: CAD (DXF/DWG) -> closed polylines become Polygon layers ----- */
+  const loadCadFile = async (file) => {
+    const ext = (file.name.match(/\.([^.]+)$/) || ["", ""])[1].toLowerCase();
+    if (ext === 'dwg') {
+      showToast("DWG يحتاج محرك DWG/WebAssembly منفصل. تم تجهيز الاستيراد، لكن النسخة الحالية تقرأ DXF مباشرة فقط.", "warn", 6000);
+      return;
+    }
+
+    try {
+      setBusy(`جارٍ قراءة CAD: ${file.name}...`);
+      const text = await file.text();
+      const raw = parseCadDxfClosedPolylines(text);
+      if (!raw.length) {
+        showToast("لم يتم العثور على Polyline / LWPOLYLINE مقفولة داخل ملف DXF", "info", 5000);
+        return;
+      }
+
+      const projected = cadLooksProjected(raw);
+      let zone = Number(utmZone) || null;
+      let hemi = utmHemi === 'S' ? 'S' : 'N';
+
+      if (projected && !zone) {
+        const z = window.prompt("ملف CAD بإحداثيات مترية. اكتب UTM Zone (مثال: 36):", "36");
+        zone = Number(z);
+        if (!Number.isInteger(zone) || zone < 1 || zone > 60) {
+          showToast("تم إلغاء استيراد CAD: Zone غير صالح", "err", 4500);
+          return;
+        }
+        const h = window.prompt("Hemisphere؟ اكتب N أو S:", "N");
+        hemi = String(h || 'N').trim().toUpperCase() === 'S' ? 'S' : 'N';
+        registerUtm(zone, hemi);
+        setUtmZone(zone); setUtmHemi(hemi);
+      } else if (projected) {
+        registerUtm(zone, hemi);
+      }
+
+      const grouped = new Map();
+      raw.forEach((f) => {
+        const name = String(f.layer || '0').trim() || '0';
+        if (!grouped.has(name)) grouped.set(name, []);
+        const ring = f.coords.map(([x, y]) => {
+          if (projected) {
+            const [lon, lat] = proj4(`EPSG:${utmEpsg(zone, hemi)}`, 'EPSG:4326', [Number(x), Number(y)]);
+            return [lon, lat];
+          }
+          return [Number(x), Number(y)];
+        });
+        grouped.get(name).push({
+          type: 'Feature',
+          geometry: { type: 'Polygon', coordinates: [ring] },
+          properties: {
+            CAD_LAYER: name,
+            SOURCE: file.name,
+            "النوع": "Polygon"
+          }
+        });
+      });
+
+      let added = 0;
+      const cadBase = file.name.replace(/\.(dxf|dwg)$/i, '') || 'CAD';
+      for (const [cadLayerName, features] of grouped) {
+        if (!features.length) continue;
+        features.forEach((f, idx) => { f.__featureId = `cad_${Date.now()}_${idx}_${Math.random().toString(36).slice(2,7)}`; });
+        const fc = { type: 'FeatureCollection', features };
+        const layerName = grouped.size === 1 ? cadBase : `${cadBase} · ${cadLayerName}`;
+        const color = LAYER_COLORS[layers.length % LAYER_COLORS.length];
+        const prj = projected ? cadUtmPrj(zone, hemi) : cadWgs84Prj();
+        const def = buildShapefileLayer(fc, layerName, prj, color, {
+          fillColor: color, fillOpacity: 0.28, outlineColor: color
+        });
+        if (!def) continue;
+        def.sourceCadFile = file.name;
+        def.sourceCadLayer = cadLayerName;
+        def.cadImported = true;
+        def.sourceExtension = '.dxf';
+        def.sourceSheetName = '';
+        def.geomType = 'Polygon';
+        def.name = layerName;
+        def.leafletLayer.addTo(mapRef.current);
+        addLayer(def);
+        added += features.length;
+      }
+
+      if (added) {
+        const allCad = layers.filter(l => l.cadImported).map(l => l.leafletLayer).filter(Boolean);
+        try {
+          const bounds = allCad.reduce((acc, l) => acc ? acc.extend(l.getBounds()) : l.getBounds(), null);
+          if (bounds?.isValid?.()) mapRef.current.fitBounds(bounds, { padding: [40, 40] });
+        } catch {}
+        showToast(`تم تحويل ${added} Polyline مقفولة إلى Polygon حقيقي داخل الخريطة`, "ok", 4500);
+      }
+    } catch (err) {
+      console.error('CAD import failed:', err);
+      showToast("تعذّر قراءة ملف DXF. تأكد أنه DXF نصي 2D", "err", 5500);
+    } finally {
+      setBusy(null);
+    }
+  };
 
   /* ----- Upload: single geodesy sheet (Excel / CSV) ----- */
   const loadSheet = async (file) => {
@@ -7244,8 +7528,8 @@ downloadBlob(
 <DropZone
   icon="upload"
 label="تحميل الملفات"
-hint="ارفع الشيب فايل والشيت معًا، أو ارفع أي ملف منهم منفردًا"
-  accept=".zip,.rar,.xlsx,.xls,.csv"
+hint="Shapefile / Excel / CSV / DXF · الـ Polyline المقفولة تتحول Polygon"
+  accept=".zip,.rar,.xlsx,.xls,.csv,.dxf,.dwg"
   multiple={true}
   onFiles={loadMixedFiles}
 />
