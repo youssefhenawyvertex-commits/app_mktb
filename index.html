@@ -3193,11 +3193,11 @@ const CADExportModal = ({ open, onClose, layers }) => {
   const dataset = useMemo(() => {
     if (!open) return { polys: [], zone: null, hemi: "N", layerCount: 0 };
     let zone = null, hemi = "N";
-    layers.forEach(l => { if (l.visible && l.kind === "shapefile" && l.zone && !zone) { zone = l.zone; hemi = l.hemi; } });
+    layers.forEach(l => { if (l.visible && (l.kind === "shapefile" || l.kind === "drawn") && l.zone && !zone) { zone = l.zone; hemi = l.hemi; } });
     const polys = [];
     let visLayerIdx = 0;
     layers.forEach((layer, li) => {
-      if (!layer.visible || layer.kind !== "shapefile") return;
+      if (!layer.visible || (layer.kind !== "shapefile" && layer.kind !== "drawn")) return;
       const layerPatternIdx = visLayerIdx % HATCH_PATTERNS.length;
       const layerOrder = visLayerIdx;
       visLayerIdx++;
@@ -7000,10 +7000,17 @@ downloadBlob(
       }
       if(!saved){showToast("لم يتم العثور على هندسات صالحة للتصدير","info",3500);return;}
       const blob=await zip.generateAsync({type:"blob",compression:"DEFLATE"});
+      // اسم الـ ZIP الخارجي = اسم شيت Excel المصدر للرسم.
+      // الملفات/المجلدات الداخلية تظل باسم الطبقة التي أنشأها المستخدم:
+      // مبني / ارض / حديقه ... إلخ.
+      const sourceSheetName =
+        exportLayers
+          .map(l => l.sourceSheetName)
+          .find(n => String(n || "").trim()) || "";
 
-      // اسم ملف الـ ZIP نفسه يأخذ اسم شيت Excel المصدر عندما يكون
-      // كل الرسم/الطبقات المصدّرة مرتبطة بنفس الشيت.
-      const zipBase = `all_shapefiles_${new Date().toISOString().slice(0,10)}`;
+      const zipBase =
+        sanitizeLayerName(sourceSheetName) ||
+        `all_shapefiles_${new Date().toISOString().slice(0,10)}`;
 
       downloadBlob(blob,`${zipBase}.zip`);
       showToast(`تم حفظ ${saved} Shapefile باسم "${zipBase}.zip"`,"ok",4200);
