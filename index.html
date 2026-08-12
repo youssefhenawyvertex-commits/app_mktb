@@ -1061,8 +1061,7 @@ function parseCadDxfClosedPolylines(text) {
 
     if (e.type === 'LWPOLYLINE') {
       const flags = Number(cadPairValue(e.pairs, 70, 0));
-      const closed = cadClosed(flags);
-      if (!closed) continue;
+      const closedByFlag = cadClosed(flags);
       const verts = [];
       let cur = null;
       for (const p of e.pairs) {
@@ -1073,6 +1072,13 @@ function parseCadDxfClosedPolylines(text) {
         else if (cur && p.code === 42) cur.bulge = Number(p.value) || 0;
       }
       if (cur) verts.push(cur);
+      const sameEnds = verts.length >= 2 &&
+        Math.hypot(Number(verts[0].x) - Number(verts[verts.length - 1].x),
+                   Number(verts[0].y) - Number(verts[verts.length - 1].y)) <= 1e-6;
+      // بعض برامج CAD ترسم الـPolyline مغلقة فعليًا (أول نقطة = آخر نقطة)
+      // لكن لا تضع bit 1 في Group Code 70. لذلك نعتمد على الإغلاق الهندسي أيضًا.
+      const closed = closedByFlag || sameEnds;
+      if (!closed) continue;
       const coords = cadExpandVertices(verts, true);
       if (coords.length >= 4) result.push({ layer, coords });
       continue;
@@ -1080,7 +1086,7 @@ function parseCadDxfClosedPolylines(text) {
 
     if (e.type === 'POLYLINE') {
       const flags = Number(cadPairValue(e.pairs, 70, 0));
-      if (!cadClosed(flags) || (flags & 8) || (flags & 16) || (flags & 32) || (flags & 64)) continue;
+      const closedByFlag = cadClosed(flags);
       const verts = [];
       for (let j = i + 1; j < entities.length; j++) {
         const v = entities[j];
@@ -1091,6 +1097,12 @@ function parseCadDxfClosedPolylines(text) {
         const bulge = Number(cadPairValue(v.pairs, 42, 0)) || 0;
         if (Number.isFinite(x) && Number.isFinite(y)) verts.push({ x, y, bulge });
       }
+      const sameEnds = verts.length >= 2 &&
+        Math.hypot(Number(verts[0].x) - Number(verts[verts.length - 1].x),
+                   Number(verts[0].y) - Number(verts[verts.length - 1].y)) <= 1e-6;
+      // نفس الفكرة مع POLYLINE القديمة: الإغلاق الهندسي يكفي حتى لو Flag غير مضبوط.
+      const closed = closedByFlag || sameEnds;
+      if (!closed) continue;
       const coords = cadExpandVertices(verts, true);
       if (coords.length >= 4) result.push({ layer, coords });
     }
