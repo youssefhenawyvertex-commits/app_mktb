@@ -5261,10 +5261,18 @@ useEffect(() => {
           ? { type: "LineString", coordinates: vertices.map(v => [v.lng, v.lat]) }
           : { type: "MultiPoint", coordinates: vertices.map(v => [v.lng, v.lat]) };
 
+    // اربط الرسم بالشيت الذي جاءت منه نقاط الجيوديسيا،
+    // حتى يكون اسم الـ Shapefile المُصدَّر مطابقًا لاسم الشيت.
+    const sourceSheetId = vertices.find(v => v?.sourceLayerId)?.sourceLayerId || null;
+    const sourceSheetName = vertices.find(v => v?.sourceLayerName)?.sourceLayerName ||
+      (sourceSheetId ? layersRef.current.find(l => l.id === sourceSheetId && l.kind === "sheet")?.name : null) || null;
+
     const def = {
       id: uid(),
       name,
       kind: "drawn",
+      sourceSheetId,
+      sourceSheetName,
       geomType: type,
       color: "#16a34a",
       visible: true,
@@ -5277,8 +5285,7 @@ useEffect(() => {
         type: "Feature",
         geometry,
         properties: {
-          ...(fixedAttributesEnabled ? attributeDataValues : {}),
-          ...(fixedAttributesEnabled && !attributeDataValues.date ? { date: fixedAttributeToday() } : {}),
+          ...(fixedAttributesEnabled ? { date: fixedAttributeToday() } : {}),
         },
         __featureId: featureId,
         drawVertices: vertices.map(v => ({ ...v })),
@@ -5288,8 +5295,7 @@ useEffect(() => {
       }]
       }],
       attributeValues: fixedAttributesEnabled ? {
-        ...attributeDataValues,
-        date: attributeDataValues.date || fixedAttributeToday(),
+        date: fixedAttributeToday(),
       } : {},
       featureLayers: new Map([[featureId, leafletLayer]]),
       hiddenFeatureIds: new Set(),
@@ -5338,7 +5344,7 @@ useEffect(() => {
             geometry,
             properties: {
               ...(layer.attributeValues || {}),
-              ...(fixedAttributesEnabled ? { date: fixedAttributeToday() } : {}),
+              ...(fixedAttributesEnabled ? { date: layer.attributeValues?.date || fixedAttributeToday() } : {}),
             },
             __featureId: newFeatureId,
             drawVertices: vertices.map(v => ({ ...v })),
@@ -5569,7 +5575,10 @@ useEffect(() => {
       `PARAMETER["Central_Meridian",${centralMeridian}],PARAMETER["Scale_Factor",0.9996],` +
       `PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]`;
 
-    const base = String(layer.name || "drawn_layer").replace(/[<>:"/\\|?*]/g, "_");
+    // اسم Shapefile المُصدَّر = اسم شيت Excel الذي تم الرسم اعتمادًا على نقاطه.
+    // لو لم يوجد شيت مصدر لأي سبب، نستخدم اسم طبقة الرسم كاحتياط.
+    const exportName = String(layer.name || "drawn_layer").trim();
+    const base = exportName.replace(/[<>:"/\\|?*]/g, "_").replace(/[. ]+$/g, "") || "drawn_layer";
     const zip = new JSZip();
     zip.file(`${base}.shp`, shpBuf);
     zip.file(`${base}.shx`, shxBuf);
@@ -5578,8 +5587,8 @@ useEffect(() => {
     zip.file(`${base}.cpg`, "UTF-8");
 
     const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
-    downloadBlob(blob, `${base}_UTM${zone}${hemi}.zip`);
-    showToast(`تم تصدير "${layer.name}" كـ Shapefile · UTM ${zone}${hemi}`, "ok", 3200);
+    downloadBlob(blob, `${base}.zip`);
+    showToast(`تم تصدير "${base}" كـ Shapefile · UTM ${zone}${hemi}`, "ok", 3200);
   };
 
   React.useEffect(() => {
@@ -5955,7 +5964,18 @@ return updated;
   const deleteLayer = (id) => {
     setLayers(prev => {
       const found = prev.find(l => l.id === id);
-      if (found) mapRef.current.removeLayer(found.leafletLayer);
+      if (found) {
+        try { mapRef.current?.removeLayer(found.leafletLayer); } catch {}
+
+        // بيانات "إضافة البيانات" ليست بيانات دائمة للتطبيق كله.
+        // عند حذف Shapefile / Drawing ننهي دورة البيانات الحالية حتى لا
+        // تظهر القيم القديمة مرة أخرى في نافذة الإضافة.
+        if (["shapefile", "drawn"].includes(found.kind)) {
+          resetAttributeDataValues();
+          setAttributeDataOpen(false);
+        }
+      }
+
       const next = prev.filter(l => l.id !== id);
       rebuildGlobalNorth(next, showNorthEdges);
       return next;
@@ -6058,14 +6078,27 @@ const focusLayer = (id) => {
   };
 
   const clearAll = () => {
-    if (layers.length === 0) { showToast("لا توجد طبقات لمسحها", "info"); return; }
-    layers.forEach(l => mapRef.current.removeLayer(l.leafletLayer));
+    if (layers.length === 0) {
+      // حتى لو كانت الخريطة فاضية، لا نسمح ببقاء بيانات دورة سابقة.
+      resetAttributeDataValues();
+      setAttributeDataOpen(false);
+      showToast("لا توجد طبقات لمسحها", "info");
+      return;
+    }
+
+    layers.forEach(l => {
+      try { mapRef.current?.removeLayer(l.leafletLayer); } catch {}
+    });
+
     setLayers([]);
+    resetAttributeDataValues();
+    setAttributeDataOpen(false);
+
     if (globalNorthRef.current) globalNorthRef.current.clearLayers();
     moveHistoryRef.current = [];
     setMovedOpsCount(0);
     setLineWarnings([]);
-    showToast("تم مسح الخريطة", "ok");
+    showToast("تم مسح الخريطة وبيانات Attribute الحالية", "ok");
   };
 
   // ── Shift+Delete: مسح كل الطبقات ──
@@ -6343,7 +6376,10 @@ const loadMixedFiles = async (files) => {
 
   /* ----- Shared Attribute Data Entry ----- */
   const [attributeDataOpen, setAttributeDataOpen] = useState(false);
-  const [attributeDataValues, setAttributeDataValues] = useState(() => ({
+
+  // القيم الموجودة في نافذة "إضافة البيانات" تخص الدورة الحالية فقط.
+  // لا يجب أن تنتقل إلى Shapefile / Drawing جديد بعد حذف الطبقة السابقة.
+  const emptyAttributeDataValues = () => ({
     "النوع": "",
     "رمز": "",
     date: fixedAttributeToday(),
@@ -6364,7 +6400,23 @@ const loadMixedFiles = async (files) => {
     des_build: "",
     usage: "",
     "رقم_1": "",
-  }));
+  });
+
+  const [attributeDataValues, setAttributeDataValues] = useState(emptyAttributeDataValues);
+
+  const resetAttributeDataValues = () => {
+    setAttributeDataValues(emptyAttributeDataValues());
+  };
+
+  const openAttributeDataModal = () => {
+    // لو مفيش Shapefile / Drawing حالياً، نبدأ دورة بيانات جديدة تماماً.
+    // ده يمنع ظهور بيانات الطبقة المحذوفة حتى لو كانت ما زالت موجودة في React state.
+    const hasTargetLayer = layers.some(l => ["shapefile", "drawn"].includes(l.kind));
+    if (!hasTargetLayer) {
+      resetAttributeDataValues();
+    }
+    setAttributeDataOpen(true);
+  };
 
   const saveAttributeDataToAllLayers = (values) => {
     const nextValues = { ...values, date: values.date || fixedAttributeToday() };
@@ -6933,9 +6985,10 @@ downloadBlob(
         if(!["Polygon","LineString","Point"].includes(type)) continue;
         const out=makeShp(layer,type); if(!out) continue;
 
-        // Keep the real layer name (including Arabic/Unicode) in the ZIP.
-        // sanitizeLayerName only removes illegal filename characters.
-        let base=sanitizeLayerName(layer.name||"layer")||"layer";
+        // اسم الـ Shapefile المُصدَّر = اسم شيت Excel الذي تم الرسم اعتمادًا على نقاطه.
+        // لو الطبقة ليست مرتبطة بشيت، نستخدم اسم الطبقة كاحتياط.
+        const exportLayerName = layer.name || "layer";
+        let base=sanitizeLayerName(exportLayerName)||"layer";
         let n=2, original=base;
         while(used.has(base)){base=(original.slice(0,Math.max(1,30-String(n).length))+"_"+n++); }
         used.add(base);
@@ -6947,8 +7000,13 @@ downloadBlob(
       }
       if(!saved){showToast("لم يتم العثور على هندسات صالحة للتصدير","info",3500);return;}
       const blob=await zip.generateAsync({type:"blob",compression:"DEFLATE"});
-      downloadBlob(blob,`all_shapefiles_${new Date().toISOString().slice(0,10)}.zip`);
-      showToast(`تم حفظ ${saved} Shapefile في ملف ZIP واحد`,"ok",4200);
+
+      // اسم ملف الـ ZIP نفسه يأخذ اسم شيت Excel المصدر عندما يكون
+      // كل الرسم/الطبقات المصدّرة مرتبطة بنفس الشيت.
+      const zipBase = `all_shapefiles_${new Date().toISOString().slice(0,10)}`;
+
+      downloadBlob(blob,`${zipBase}.zip`);
+      showToast(`تم حفظ ${saved} Shapefile باسم "${zipBase}.zip"`,"ok",4200);
     }catch(err){
       console.error("Export all shapefiles failed:",err);
       showToast("فشل حفظ كل الشيبفيلات","err",5000);
@@ -7147,7 +7205,7 @@ downloadBlob(
 
           {/* ── إضافة البيانات ── */}
           <button
-            onClick={() => setAttributeDataOpen(true)}
+            onClick={openAttributeDataModal}
             className="w-full rounded-xl border border-slate-200 bg-white hover:bg-slate-50 px-3 py-2.5 flex items-center gap-2.5 transition text-right"
           >
             <span className="grid place-items-center w-8 h-8 rounded-lg shrink-0 bg-slate-50 text-slate-700 text-lg">＋</span>
