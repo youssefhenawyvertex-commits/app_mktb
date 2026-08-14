@@ -5058,8 +5058,8 @@ useEffect(() => {
 
   /* ────────────────────────────────────────────────────────────────────────
      PRECISION DRAWING
-     الرسم لا يسمح بوضع Vertex حر:
-     كل Vertex يجب أن يلتقط نقطة جيوديسيا فعلية من طبقة Excel/CSV.
+     الرسم أصبح يسمح بوضع Vertex حر:
+     كل Vertex يمكن وضعه بحرية على الخريطة، وSnap على نقاط الجيوديسيا اختياري.
      لذلك الإحداثي المخزن هو نفس Lat/Lon للنقطة نفسها، ثم يُصدّر إلى
      الـ UTM Zone المختار بدون تقريب.
      ──────────────────────────────────────────────────────────────────────── */
@@ -5394,10 +5394,10 @@ useEffect(() => {
     if (vertices.length < min) {
       showToast(
         type === "Polygon"
-          ? "المضلع يحتاج 3 نقاط جيوديسيا على الأقل"
+          ? "المضلع يحتاج 3 نقاط على الأقل"
           : type === "LineString"
-            ? "الخط يحتاج نقطتين جيوديسيا على الأقل"
-            : "حدد نقطة جيوديسيا",
+            ? "الخط يحتاج نقطتين على الأقل"
+            : "حدد نقطة على الخريطة",
         "err",
         3000
       );
@@ -5615,7 +5615,7 @@ useEffect(() => {
       clearDrawingPreview();
       syncDrawVertices([]);
       setDrawingActive(false);
-      showToast(`تم حفظ طبقة "${name}" بدقة على نقاط الجيوديسيا`, "ok", 3200);
+      showToast(`تم حفظ طبقة "${name}" بنجاح`, "ok", 3200);
     }
   };
 
@@ -7368,7 +7368,7 @@ downloadBlob(
           <ActionButton
             icon="poly"
             label="إنشاء طبقة ورسم"
-            hint="ارسم بدقة على نقاط الجيوديسيا فقط"
+            hint="ارسم بحرية مع إمكانية Snap على نقاط الجيوديسيا"
             tone="accent"
             onClick={() => {
               setDrawConfig(v => ({
@@ -7918,7 +7918,7 @@ title="تحريك الشيب فايل"
             <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
               <div>
                 <div className="text-[16px] font-bold text-slate-900">إنشاء طبقة ورسم دقيق</div>
-                <div className="text-[11px] text-slate-500 mt-1">كل Vertex سيتم التقاطه من نقطة جيوديسيا فعلية</div>
+                <div className="text-[11px] text-slate-500 mt-1">يمكن الرسم بحرية، وSnap اختياري لنقاط الجيوديسيا</div>
               </div>
               <button onClick={() => setDrawOpen(false)} className="w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-500">×</button>
             </div>
@@ -8622,12 +8622,30 @@ const AttributeDataModal = ({ open, onClose, fields, initialValues, onSave, targ
 
   if (!open) return null;
 
+  // location تُبنى تلقائيًا من gov + sec + ssec.
+  // أي قيمة فارغة يتم تجاهلها، لذلك لا تظهر شرطات زائدة.
+  const buildLocation = (data) => {
+    return [data.gov, data.sec, data.ssec]
+      .map(v => String(v ?? "").trim())
+      .filter(Boolean)
+      .join(" - ");
+  };
+
   const setValue = (key, value) => {
-    setValues(prev => ({ ...prev, [key]: value }));
+    setValues(prev => {
+      const next = { ...prev, [key]: value };
+
+      if (key === "gov" || key === "sec" || key === "ssec") {
+        next.location = buildLocation(next);
+      }
+
+      return next;
+    });
   };
 
   const save = () => {
     const next = { ...values };
+    next.location = buildLocation(next);
     if (!next.date) next.date = fixedAttributeToday();
     onSave(next);
   };
@@ -8667,13 +8685,54 @@ const AttributeDataModal = ({ open, onClose, fields, initialValues, onSave, targ
                   <span>{field.name}</span>
                   {field.required && <span className="text-rose-500">*</span>}
                 </div>
-                <input
-                  type={field.type === "number" ? "number" : field.type === "date" ? "date" : "text"}
-                  value={values[field.key] ?? ""}
-                  onChange={e => setValue(field.key, e.target.value)}
-                  className="w-full h-9 rounded-lg border border-[var(--line)] bg-[var(--panel)] px-2.5 text-[11px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
-                  placeholder={field.type === "date" ? fixedAttributeToday() : `أدخل ${field.name}`}
-                />
+                {field.key === "النوع" ? (
+                  <select
+                    value={values[field.key] ?? ""}
+                    onChange={e => setValue(field.key, e.target.value)}
+                    className="w-full h-9 rounded-lg border border-[var(--line)] bg-[var(--panel)] px-2.5 text-[11px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                  >
+                    <option value="">اختر النوع</option>
+                    <option value="مبني">مبني</option>
+                    <option value="ارض">ارض</option>
+                  </select>
+                ) : field.key === "usage" ? (
+                  <select
+                    value={values[field.key] ?? ""}
+                    onChange={e => setValue(field.key, e.target.value)}
+                    className="w-full h-9 rounded-lg border border-[var(--line)] bg-[var(--panel)] px-2.5 text-[11px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                  >
+                    <option value="">اختر الاستخدام</option>
+                    <option value="سكني">سكني</option>
+                    <option value="تجاري">تجاري</option>
+                    <option value="زراعي">زراعي</option>
+                  </select>
+                ) : field.key === "des_build" ? (
+                  <select
+                    value={values[field.key] ?? ""}
+                    onChange={e => setValue(field.key, e.target.value)}
+                    className="w-full h-9 rounded-lg border border-[var(--line)] bg-[var(--panel)] px-2.5 text-[11px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                  >
+                    <option value="">اختر الوصف</option>
+                    <option value="مبني">مبني</option>
+                    <option value="ارض">ارض</option>
+                  </select>
+                ) : field.key === "location" ? (
+                  <input
+                    type="text"
+                    value={buildLocation(values)}
+                    readOnly
+                    className="w-full h-9 rounded-lg border border-[var(--line)] bg-[var(--panel-2)] px-2.5 text-[11px] text-[var(--ink)] outline-none cursor-not-allowed"
+                    placeholder="يتم تكوين الموقع تلقائيًا"
+                  />
+                ) : (
+                  <input
+                    type={field.type === "number" ? "number" : field.type === "date" ? "date" : "text"}
+                    value={values[field.key] ?? ""}
+                    onChange={e => setValue(field.key, e.target.value)}
+                    className="w-full h-9 rounded-lg border border-[var(--line)] bg-[var(--panel)] px-2.5 text-[11px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                    placeholder={field.type === "date" ? fixedAttributeToday() : `أدخل ${field.name}`}
+                  />
+                )}
               </label>
             ))}
           </div>
