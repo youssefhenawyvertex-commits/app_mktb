@@ -5364,12 +5364,8 @@ useEffect(() => {
   const startDrawing = () => {
     if (!mapRef.current) return;
 
-    const hasPoints = getGeodesySnapCandidates().length > 0;
-    if (!hasPoints) {
-      showToast("ارفع شيت الجيوديسيا أولاً — الرسم يعتمد على نقاطه فقط", "err", 4500);
-      return;
-    }
-
+    // الرسم حر ولا يشترط وجود شيت جيوديسيا.
+    // نقاط الجيوديسيا تستخدم فقط عند تفعيل Snap.
     const zone = Number(drawConfig.zone);
     if (!Number.isInteger(zone) || zone < 1 || zone > 60) {
       showToast("حدد UTM Zone صحيحة قبل بدء الرسم", "err", 3500);
