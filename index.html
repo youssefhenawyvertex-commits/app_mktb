@@ -2588,7 +2588,7 @@ function hexToKmlColors(hex) {
 const xmlEscape = (s) => String(s ?? "").replace(/[<>&"']/g, c => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;", '"':"&quot;", "'":"&apos;" }[c]));
 
 /** Build a KML document containing only the supplied polygon folders. */
-function buildKML(folders, docName = "دليل المراجع الذكي") {
+function buildKML(folders, docName = "دليل المكتب الفني الذكي") {
   const lines = [];
   lines.push('<?xml version="1.0" encoding="UTF-8"?>');
   lines.push('<kml xmlns="http://www.opengis.net/kml/2.2">');
@@ -7325,7 +7325,7 @@ downloadBlob(
             <Icon name="compass" size={22} />
           </div>
           <div className="min-w-0">
-            <div className="text-[15px] font-bold text-slate-900 leading-tight">دليل المراجع الذكي</div>
+            <div className="text-[15px] font-bold text-slate-900 leading-tight">دليل المكتب الفني الذكي</div>
             <div className="text-[11px] text-slate-500 mt-0.5 font-mono tracking-tight">SMART REFERENCE GUIDE</div>
           </div>
           <button
