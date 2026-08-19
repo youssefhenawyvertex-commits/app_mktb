@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -2790,10 +2791,10 @@ const FIXED_ATTRIBUTE_FIELDS = [
   { name: "east", key: "east", type: "text" },
   { name: "west", key: "west", type: "text" },
   { name: "location", key: "location", type: "text" },
-  { name: "desciptio", key: "desciptio", type: "text" },
+  { name: "descriptio", key: "descriptio", type: "text" },
   { name: "des_build", key: "des_build", type: "text" },
   { name: "usage", key: "usage", type: "text" },
-  { name: "رقم_1", key: "رقم_1", type: "text" },
+  { name: "رقم_ا", key: "رقم_ا", type: "text" },
 ];
 
 function fixedAttributeToday() {
@@ -2838,6 +2839,48 @@ function applyFixedAttributesToLayer(layer) {
 
   layer.attributeFields = FIXED_ATTRIBUTE_FIELDS.map(f => ({ ...f }));
   layer.attributesEnabled = true;
+  return layer;
+}
+
+/* SHAPE_Leng / SHAPE_Area calculated geometry attributes */
+const SHAPE_METRIC_FIELDS = [
+  { name: "SHAPE_Leng", key: "SHAPE_Leng", type: "number" },
+  { name: "SHAPE_Area", key: "SHAPE_Area", type: "number" },
+];
+
+function calculateShapeMetricProperties(feature, layer) {
+  const g = feature?.geometry;
+  if (!g) return { SHAPE_Leng: 0, SHAPE_Area: 0 };
+  const zone = Number(layer?.zone);
+  const z = Number.isInteger(zone) && zone >= 1 && zone <= 60 ? zone : null;
+  const hemi = layer?.hemi === "S" ? "S" : "N";
+  let length = 0, area = 0;
+  if (g.type === "Polygon") {
+    for (const ring of g.coordinates || []) length += polylineLengthMeters(ring, z, hemi);
+    area = polygonAreaMeters(g.coordinates, z, hemi);
+  } else if (g.type === "MultiPolygon") {
+    for (const rings of g.coordinates || []) {
+      for (const ring of rings || []) length += polylineLengthMeters(ring, z, hemi);
+      area += polygonAreaMeters(rings, z, hemi);
+    }
+  } else if (g.type === "LineString") {
+    length = polylineLengthMeters(g.coordinates || [], z, hemi);
+  } else if (g.type === "MultiLineString") {
+    for (const line of g.coordinates || []) length += polylineLengthMeters(line, z, hemi);
+  }
+  return {
+    SHAPE_Leng: Number.isFinite(length) ? Number(length.toFixed(3)) : 0,
+    SHAPE_Area: Number.isFinite(area) ? Number(area.toFixed(3)) : 0,
+  };
+}
+
+function applyShapeMetricsToLayer(layer) {
+  if (!layer || !["shapefile", "drawn"].includes(layer.kind)) return layer;
+  (layer.geojson || []).forEach(fc => (fc.features || []).forEach(feature => {
+    feature.properties = { ...(feature.properties || {}), ...calculateShapeMetricProperties(feature, layer) };
+  }));
+  layer.shapeMetricsEnabled = true;
+  layer.shapeMetricFields = SHAPE_METRIC_FIELDS.map(f => ({ ...f }));
   return layer;
 }
 
@@ -4478,6 +4521,7 @@ const [baseMapOpen, setBaseMapOpen] = useState(false);
 
   const [layers, setLayers] = useState([]);
 const [fixedAttributesEnabled, setFixedAttributesEnabled] = useState(false);
+const [shapeMetricsEnabled, setShapeMetricsEnabled] = useState(false);
   const layersRef = useRef([]);
 
 useEffect(() => {
@@ -6026,10 +6070,25 @@ const applyFixedAttributesToAllLayers = (enable = true) => {
   );
 };
 
+const applyShapeMetricsToAllLayers = (enable = true) => {
+  setShapeMetricsEnabled(enable);
+  if (!enable) return;
+  setLayers(prev => {
+    const next = prev.map(layer => ["shapefile", "drawn"].includes(layer.kind) ? applyShapeMetricsToLayer(layer) : layer);
+    rebuildGlobalNorth(next, showNorthEdges);
+    return next;
+  });
+  const eligibleCount = layers.filter(l => ["shapefile", "drawn"].includes(l.kind)).length;
+  showToast(eligibleCount
+    ? `تمت إضافة SHAPE_Leng و SHAPE_Area وحسابهما لـ ${eligibleCount} طبقة`
+    : "تم تفعيل SHAPE_Leng و SHAPE_Area — سيُحسبان تلقائيًا لأي Shapefile أو رسم جديد",
+    "ok", 4000);
+};
+
 const addLayer = (def) => setLayers(L => {
-  const prepared = fixedAttributesEnabled && ["shapefile", "drawn"].includes(def?.kind)
-    ? applyFixedAttributesToLayer(def)
-    : def;
+  let prepared = def;
+  if (fixedAttributesEnabled && ["shapefile", "drawn"].includes(prepared?.kind)) prepared = applyFixedAttributesToLayer(prepared);
+  if (shapeMetricsEnabled && ["shapefile", "drawn"].includes(prepared?.kind)) prepared = applyShapeMetricsToLayer(prepared);
   const next = [...L, prepared];
   rebuildGlobalNorth(next, showNorthEdges);
   requestAnimationFrame(() => syncLayerStackOrder(next));
@@ -6688,10 +6747,10 @@ const loadMixedFiles = async (files) => {
     east: "",
     west: "",
     location: "",
-    desciptio: "",
+    descriptio: "",
     des_build: "",
     usage: "",
-    "رقم_1": "",
+    "رقم_ا": "",
   });
 
   const [attributeDataValues, setAttributeDataValues] = useState(emptyAttributeDataValues);
@@ -6701,12 +6760,55 @@ const loadMixedFiles = async (files) => {
   };
 
   const openAttributeDataModal = () => {
-    // لو مفيش Shapefile / Drawing حالياً، نبدأ دورة بيانات جديدة تماماً.
-    // ده يمنع ظهور بيانات الطبقة المحذوفة حتى لو كانت ما زالت موجودة في React state.
-    const hasTargetLayer = layers.some(l => ["shapefile", "drawn"].includes(l.kind));
-    if (!hasTargetLayer) {
+    // لو فيه Shapefile / Drawing حالي، اعرض بيانات الـ Attributes الموجودة
+    // بالفعل داخل أول Feature بدل ما نفتح النموذج بقيم فارغة.
+    const targetLayer = layers.find(l => ["shapefile", "drawn"].includes(l.kind));
+
+    if (!targetLayer) {
       resetAttributeDataValues();
+      setAttributeDataOpen(true);
+      return;
     }
+
+    let existingValues = {};
+
+    if (targetLayer.kind === "shapefile") {
+      const firstFeature = (targetLayer.geojson || [])
+        .flatMap(fc => fc?.features || [])
+        .find(feature => feature?.properties);
+
+      existingValues = { ...(firstFeature?.properties || {}) };
+    } else {
+      existingValues = { ...(targetLayer.attributeValues || {}) };
+    }
+
+    // نملأ فقط الحقول الموجودة في نموذج "إضافة البيانات".
+    // أي حقل غير موجود في الـ Shapefile يظل بالقيمة الافتراضية.
+    const defaults = emptyAttributeDataValues();
+    const mergedValues = { ...defaults };
+
+    FIXED_ATTRIBUTE_FIELDS.forEach(field => {
+      if (
+        Object.prototype.hasOwnProperty.call(existingValues, field.key) &&
+        existingValues[field.key] != null
+      ) {
+        mergedValues[field.key] = String(existingValues[field.key]);
+      }
+    });
+
+    // التاريخ: لو موجود في الـ Shapefile نستخدمه، وإلا تاريخ اليوم.
+    mergedValues.date =
+      existingValues.date != null && String(existingValues.date).trim()
+        ? String(existingValues.date)
+        : defaults.date;
+
+    // location يتم تكوينه من gov + sec + ssec.
+    mergedValues.location = [mergedValues.gov, mergedValues.sec, mergedValues.ssec]
+      .map(v => String(v ?? "").trim())
+      .filter(Boolean)
+      .join(" - ");
+
+    setAttributeDataValues(mergedValues);
     setAttributeDataOpen(true);
   };
 
@@ -7111,8 +7213,9 @@ downloadBlob(
       "النوع":"TYPE", "رمز":"CODE", date:"DATE", request_nu:"REQUEST_N",
       name:"NAME", surveyor:"SURVEYOR", company:"COMPANY", surv_num:"SURV_NUM",
       gov:"GOV", sec:"SEC", ssec:"SSEC", north:"NORTH", south:"SOUTH",
-      east:"EAST", west:"WEST", location:"LOCATION", desciptio:"DESCIPTIO",
-      des_build:"DES_BUILD", usage:"USAGE", "رقم_1":"NUM_1"
+      east:"EAST", west:"WEST", location:"LOCATION", descriptio:"DESCRIPTIO",
+      SHAPE_Leng:"SHAPE_Leng", SHAPE_Area:"SHAPE_Area",
+      des_build:"DES_BUILD", usage:"USAGE", "رقم_ا":"NUM_1"
     };
 
     const fieldName = (key, i) => {
@@ -7894,6 +7997,13 @@ title="تحريك الشيب فايل"
                 title="إضافة Attribute ثابت إلى كل طبقات الرسم وShapefile"
               >
                 {fixedAttributesEnabled ? "Attribute ✓" : "إضافة Attribute"}
+              </button>
+              <button
+                onClick={(e) => { e.stopPropagation(); applyShapeMetricsToAllLayers(true); }}
+                className={`h-8 px-2.5 rounded-lg text-[11px] font-bold border transition shrink-0 ${shapeMetricsEnabled ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-[var(--panel)] border-[var(--line)] text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-ink)]"}`}
+                title="إضافة وحساب SHAPE_Leng و SHAPE_Area لكل Feature"
+              >
+                {shapeMetricsEnabled ? "Shape ✓" : "إضافة Shape"}
               </button>
               <Icon name={layersPanelOpen ? "chevronDown" : "chevronUp"} size={18} className="text-slate-500" />
             </button>
