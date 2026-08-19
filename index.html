@@ -1,4 +1,5 @@
 
+
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -1266,6 +1267,7 @@ async function readPrjFromZip(arrayBuffer) {
     return await prj.async("string");
   } catch (e) {
     console.warn("readPrjFromZip:", e);
+
     return null;
   }
 }
@@ -2796,6 +2798,59 @@ const FIXED_ATTRIBUTE_FIELDS = [
   { name: "usage", key: "usage", type: "text" },
   { name: "رقم_ا", key: "رقم_ا", type: "text" },
 ];
+
+// نفس أسماء حقول الـ DBF المستخدمة عند التصدير (exportAllShapefiles)،
+// عشان لو المستخدم استورد Shapefile كان مُصدَّر من التطبيق ده قبل كده،
+// نقدر نعرف بيانات كل حقل ونعرضها في نافذة "إضافة البيانات" للتعديل.
+const ATTRIBUTE_FIELD_DBF_ALIAS = {
+  "النوع": "TYPE", "رمز": "CODE", date: "DATE", request_nu: "REQUEST_N",
+  name: "NAME", surveyor: "SURVEYOR", company: "COMPANY", surv_num: "SURV_NUM",
+  gov: "GOV", sec: "SEC", ssec: "SSEC", north: "NORTH", south: "SOUTH",
+  east: "EAST", west: "WEST", location: "LOCATION", descriptio: "DESCRIPTIO",
+  des_build: "DES_BUILD", usage: "USAGE", "رقم_ا": "NUM_A",
+};
+
+// يحاول يلاقي قيمة الحقل الداخلي (key) جوه properties بغض النظر عن
+// الحالة (upper/lower) أو استخدام اسم الـ DBF المرادف بدل الاسم الداخلي.
+function readAttributeFieldValue(props, key) {
+  if (!props) return undefined;
+  if (props[key] != null) return props[key];
+
+  const alias = ATTRIBUTE_FIELD_DBF_ALIAS[key];
+  if (alias && props[alias] != null) return props[alias];
+
+  const lowerKey = String(key).toLowerCase();
+  const foundKey = Object.keys(props).find(k => String(k).toLowerCase() === lowerKey);
+  return foundKey ? props[foundKey] : undefined;
+}
+
+// يبني object بمفاتيح FIXED_ATTRIBUTE_FIELDS الداخلية من بيانات طبقة
+// (سواء attributeValues أو أول feature properties)، لاستخدامه في تعبئة
+// نافذة "إضافة البيانات" بالقيم الحالية الفعلية بدل ما تظهر فاضية.
+function extractAttributeValuesFromLayer(layer) {
+  if (!layer) return null;
+
+  const sourceProps = layer.attributeValues ||
+    (Array.isArray(layer.geojson)
+      ? layer.geojson.flatMap(fc => fc?.features || [])[0]?.properties
+      : null);
+
+  if (!sourceProps) return null;
+
+  const values = {};
+  let hasAny = false;
+
+  FIXED_ATTRIBUTE_FIELDS.forEach(f => {
+    const v = readAttributeFieldValue(sourceProps, f.key);
+    if (v != null && String(v).trim() !== "") {
+      values[f.key] = v;
+      hasAny = true;
+    }
+  });
+
+  return hasAny ? values : null;
+}
+
 
 function fixedAttributeToday() {
   const d = new Date();
@@ -6089,6 +6144,31 @@ const addLayer = (def) => setLayers(L => {
   let prepared = def;
   if (fixedAttributesEnabled && ["shapefile", "drawn"].includes(prepared?.kind)) prepared = applyFixedAttributesToLayer(prepared);
   if (shapeMetricsEnabled && ["shapefile", "drawn"].includes(prepared?.kind)) prepared = applyShapeMetricsToLayer(prepared);
+
+  // لو المستخدم سبق وحفظ بيانات عبر "إضافة البيانات" قبل استيراد هذه الطبقة،
+  // نطبّقها تلقائياً هنا (هذا هو الوعد الظاهر في رسالة التوست عند الحفظ).
+  if (["shapefile", "drawn"].includes(prepared?.kind)) {
+    const hasSavedAttributeData = Object.entries(attributeDataValues || {})
+      .some(([k, v]) => k !== "date" && String(v ?? "").trim() !== "");
+
+    if (hasSavedAttributeData) {
+      const nextValues = { ...attributeDataValues, date: attributeDataValues.date || fixedAttributeToday() };
+
+      prepared = {
+        ...prepared,
+        attributeValues: { ...(prepared.attributeValues || {}), ...nextValues },
+        attributesEnabled: true,
+        attributeFields: FIXED_ATTRIBUTE_FIELDS.map(f => ({ ...f })),
+      };
+
+      (prepared.geojson || []).forEach(fc => {
+        (fc.features || []).forEach(feature => {
+          feature.properties = { ...(feature.properties || {}), ...nextValues };
+        });
+      });
+    }
+  }
+
   const next = [...L, prepared];
   rebuildGlobalNorth(next, showNorthEdges);
   requestAnimationFrame(() => syncLayerStackOrder(next));
@@ -6759,81 +6839,26 @@ const loadMixedFiles = async (files) => {
     setAttributeDataValues(emptyAttributeDataValues());
   };
 
-  const saveAttributeDataToAllLayers = (values) => {
-  // نعمل نسخة مستقلة من البيانات
-  const nextValues = {
-    ...values,
-    date: values.date || fixedAttributeToday()
+  const openAttributeDataModal = () => {
+    // نجيب آخر طبقة Shapefile/Drawn موجودة، ونعرض بياناتها الحالية
+    // في النافذة عشان المستخدم يقدر يعدّلها بدل ما يلاقي الحقول فاضية.
+    // extractAttributeValuesFromLayer بيتعرف على القيم حتى لو كانت
+    // مخزّنة بأسماء حقول DBF (مثل REQUEST_N بدل request_nu) من شيبفايل
+    // كان اتصدّر من التطبيق ده قبل كده وتم استيراده تاني.
+    const eligibleLayers = layers.filter(l => ["shapefile", "drawn"].includes(l.kind));
+    const lastLayer = eligibleLayers[eligibleLayers.length - 1];
+    const currentValues = lastLayer ? extractAttributeValuesFromLayer(lastLayer) : null;
+
+    if (currentValues) {
+      setAttributeDataValues({
+        ...emptyAttributeDataValues(),
+        ...currentValues,
+      });
+    }
+
+    setAttributeDataOpen(true);
   };
 
-  // نحفظ آخر نسخة في State الخاصة بالنافذة
-  setAttributeDataValues(nextValues);
-
-  setLayers(prev =>
-    prev.map(layer => {
-      if (!["shapefile", "drawn"].includes(layer.kind)) {
-        return layer;
-      }
-
-      /*
-       * attributeValues هو المصدر الدائم لبيانات
-       * "إدخال البيانات" الخاصة بهذه الطبقة.
-       *
-       * نضع nextValues بالكامل وليس فقط البيانات القديمة.
-       */
-      const nextLayer = {
-        ...layer,
-
-        attributeValues: {
-          ...(layer.attributeValues || {}),
-          ...nextValues
-        },
-
-        attributesEnabled: true,
-
-        attributeFields: FIXED_ATTRIBUTE_FIELDS.map(f => ({
-          ...f
-        }))
-      };
-
-      /*
-       * تحديث الـ Properties داخل جميع الـ Features
-       * حتى تظل البيانات موجودة أيضاً داخل الـ GeoJSON.
-       */
-      if (Array.isArray(nextLayer.geojson)) {
-        nextLayer.geojson = nextLayer.geojson.map(fc => ({
-          ...fc,
-
-          features: (fc.features || []).map(feature => ({
-            ...feature,
-
-            properties: {
-              ...(feature.properties || {}),
-              ...nextValues
-            }
-          }))
-        }));
-      }
-
-      return nextLayer;
-    })
-  );
-
-  const count = layers.filter(
-    l => ["shapefile", "drawn"].includes(l.kind)
-  ).length;
-
-  showToast(
-    count
-      ? `تم حفظ البيانات وتطبيقها على ${count} طبقة مرة واحدة`
-      : "تم حفظ البيانات، وستُطبق تلقائيًا على الطبقات الجديدة",
-    "ok",
-    4000
-  );
-
-  setAttributeDataOpen(false);
-};
-  
   const saveAttributeDataToAllLayers = (values) => {
     const nextValues = { ...values, date: values.date || fixedAttributeToday() };
 
