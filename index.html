@@ -6759,59 +6759,81 @@ const loadMixedFiles = async (files) => {
     setAttributeDataValues(emptyAttributeDataValues());
   };
 
-  const openAttributeDataModal = () => {
-    // لو فيه Shapefile / Drawing حالي، اعرض بيانات الـ Attributes الموجودة
-    // بالفعل داخل أول Feature بدل ما نفتح النموذج بقيم فارغة.
-    const targetLayer = layers.find(l => ["shapefile", "drawn"].includes(l.kind));
-
-    if (!targetLayer) {
-      resetAttributeDataValues();
-      setAttributeDataOpen(true);
-      return;
-    }
-
-    let existingValues = {};
-
-    if (targetLayer.kind === "shapefile") {
-      const firstFeature = (targetLayer.geojson || [])
-        .flatMap(fc => fc?.features || [])
-        .find(feature => feature?.properties);
-
-      existingValues = { ...(firstFeature?.properties || {}) };
-    } else {
-      existingValues = { ...(targetLayer.attributeValues || {}) };
-    }
-
-    // نملأ فقط الحقول الموجودة في نموذج "إضافة البيانات".
-    // أي حقل غير موجود في الـ Shapefile يظل بالقيمة الافتراضية.
-    const defaults = emptyAttributeDataValues();
-    const mergedValues = { ...defaults };
-
-    FIXED_ATTRIBUTE_FIELDS.forEach(field => {
-      if (
-        Object.prototype.hasOwnProperty.call(existingValues, field.key) &&
-        existingValues[field.key] != null
-      ) {
-        mergedValues[field.key] = String(existingValues[field.key]);
-      }
-    });
-
-    // التاريخ: لو موجود في الـ Shapefile نستخدمه، وإلا تاريخ اليوم.
-    mergedValues.date =
-      existingValues.date != null && String(existingValues.date).trim()
-        ? String(existingValues.date)
-        : defaults.date;
-
-    // location يتم تكوينه من gov + sec + ssec.
-    mergedValues.location = [mergedValues.gov, mergedValues.sec, mergedValues.ssec]
-      .map(v => String(v ?? "").trim())
-      .filter(Boolean)
-      .join(" - ");
-
-    setAttributeDataValues(mergedValues);
-    setAttributeDataOpen(true);
+  const saveAttributeDataToAllLayers = (values) => {
+  // نعمل نسخة مستقلة من البيانات
+  const nextValues = {
+    ...values,
+    date: values.date || fixedAttributeToday()
   };
 
+  // نحفظ آخر نسخة في State الخاصة بالنافذة
+  setAttributeDataValues(nextValues);
+
+  setLayers(prev =>
+    prev.map(layer => {
+      if (!["shapefile", "drawn"].includes(layer.kind)) {
+        return layer;
+      }
+
+      /*
+       * attributeValues هو المصدر الدائم لبيانات
+       * "إدخال البيانات" الخاصة بهذه الطبقة.
+       *
+       * نضع nextValues بالكامل وليس فقط البيانات القديمة.
+       */
+      const nextLayer = {
+        ...layer,
+
+        attributeValues: {
+          ...(layer.attributeValues || {}),
+          ...nextValues
+        },
+
+        attributesEnabled: true,
+
+        attributeFields: FIXED_ATTRIBUTE_FIELDS.map(f => ({
+          ...f
+        }))
+      };
+
+      /*
+       * تحديث الـ Properties داخل جميع الـ Features
+       * حتى تظل البيانات موجودة أيضاً داخل الـ GeoJSON.
+       */
+      if (Array.isArray(nextLayer.geojson)) {
+        nextLayer.geojson = nextLayer.geojson.map(fc => ({
+          ...fc,
+
+          features: (fc.features || []).map(feature => ({
+            ...feature,
+
+            properties: {
+              ...(feature.properties || {}),
+              ...nextValues
+            }
+          }))
+        }));
+      }
+
+      return nextLayer;
+    })
+  );
+
+  const count = layers.filter(
+    l => ["shapefile", "drawn"].includes(l.kind)
+  ).length;
+
+  showToast(
+    count
+      ? `تم حفظ البيانات وتطبيقها على ${count} طبقة مرة واحدة`
+      : "تم حفظ البيانات، وستُطبق تلقائيًا على الطبقات الجديدة",
+    "ok",
+    4000
+  );
+
+  setAttributeDataOpen(false);
+};
+  
   const saveAttributeDataToAllLayers = (values) => {
     const nextValues = { ...values, date: values.date || fixedAttributeToday() };
 
